@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# career-ops batch runner — standalone orchestrator for AI CLI workers
-# Reads batch-input.tsv, delegates each offer to a configured worker,
+# career-ops batch runner — standalone orchestrator for claude -p workers
+# Reads batch-input.tsv, delegates each offer to a claude -p worker,
 # tracks state in batch-state.tsv for resumability.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,13 +28,11 @@ RETRY_FAILED=false
 START_FROM=0
 MAX_RETRIES=2
 MIN_SCORE=0
-PROVIDER="${CAREER_OPS_PROVIDER:-}"
-PROVIDER_CLI=""
 
 usage() {
   cat <<'USAGE'
-career-ops batch runner — process job offers in batch via AI CLI workers
-Uses the provider configured in config/profile.yml, or CAREER_OPS_PROVIDER.
+career-ops batch runner — process job offers in batch via claude -p workers
+Uses your default Claude model (Claude Max subscription).
 
 Usage: batch-runner.sh [OPTIONS]
 
@@ -45,7 +43,6 @@ Options:
   --start-from N       Start from offer ID N (skip earlier IDs)
   --max-retries N      Max retry attempts per offer (default: 2)
   --min-score N        Skip PDF/tracker for offers scoring below N (default: 0 = off)
-  --provider NAME      Worker provider: claude | codex | qwen
   -h, --help           Show this help
 
 Files:
@@ -67,9 +64,6 @@ Examples:
 
   # Process 2 at a time starting from ID 10
   ./batch-runner.sh --parallel 2 --start-from 10
-
-  # Force Codex as the worker backend
-  ./batch-runner.sh --provider codex
 USAGE
 }
 
@@ -82,58 +76,10 @@ while [[ $# -gt 0 ]]; do
     --start-from) START_FROM="$2"; shift 2 ;;
     --max-retries) MAX_RETRIES="$2"; shift 2 ;;
     --min-score) MIN_SCORE="$2"; shift 2 ;;
-    --provider) PROVIDER="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
-
-load_provider_config() {
-  local profile_file="$PROJECT_DIR/config/profile.yml"
-
-  if [[ -z "$PROVIDER" ]]; then
-    if [[ -f "$profile_file" ]]; then
-      PROVIDER=$(node -e '
-const fs = require("fs")
-const yaml = require("js-yaml")
-const path = process.argv[1]
-try {
-  const data = yaml.load(fs.readFileSync(path, "utf8")) || {}
-  process.stdout.write(data.provider?.default || "")
-} catch {
-  process.stdout.write("")
-}
-' "$profile_file")
-    fi
-  fi
-
-  PROVIDER="${PROVIDER:-claude}"
-
-  if [[ -f "$profile_file" ]]; then
-    PROVIDER_CLI=$(node -e '
-const fs = require("fs")
-const yaml = require("js-yaml")
-const path = process.argv[1]
-const provider = process.argv[2]
-try {
-  const data = yaml.load(fs.readFileSync(path, "utf8")) || {}
-  process.stdout.write(data.provider?.[provider]?.cli_bin || "")
-} catch {
-  process.stdout.write("")
-}
-' "$profile_file" "$PROVIDER")
-  fi
-
-  case "$PROVIDER" in
-    claude) PROVIDER_CLI="${PROVIDER_CLI:-claude}" ;;
-    codex) PROVIDER_CLI="${PROVIDER_CLI:-codex}" ;;
-    qwen) PROVIDER_CLI="${PROVIDER_CLI:-qwen}" ;;
-    *)
-      echo "ERROR: Unsupported provider '$PROVIDER'. Use claude, codex, or qwen."
-      exit 1
-      ;;
-  esac
-}
 
 # Lock file to prevent double execution
 acquire_lock() {
@@ -173,44 +119,12 @@ check_prerequisites() {
     exit 1
   fi
 
-  load_provider_config
-
-  if ! command -v "$PROVIDER_CLI" &>/dev/null; then
-    echo "ERROR: '$PROVIDER_CLI' CLI not found in PATH for provider '$PROVIDER'."
+  if ! command -v claude &>/dev/null; then
+    echo "ERROR: 'claude' CLI not found in PATH."
     exit 1
   fi
 
   mkdir -p "$LOGS_DIR" "$TRACKER_DIR" "$REPORTS_DIR"
-}
-
-run_worker() {
-  local resolved_prompt="$1"
-  local prompt="$2"
-  local log_file="$3"
-
-  case "$PROVIDER" in
-    claude)
-      "$PROVIDER_CLI" -p \
-        --dangerously-skip-permissions \
-        --append-system-prompt-file "$resolved_prompt" \
-        "$prompt" \
-        > "$log_file" 2>&1
-      ;;
-    codex)
-      {
-        cat "$resolved_prompt"
-        printf '\n\n## Runtime Task\n%s\n' "$prompt"
-      } | "$PROVIDER_CLI" exec \
-        --dangerously-bypass-approvals-and-sandbox \
-        -C "$PROJECT_DIR" \
-        --skip-git-repo-check \
-        - > "$log_file" 2>&1
-      ;;
-    qwen)
-      echo "ERROR: Provider 'qwen' is configured but this runner does not yet know the correct non-interactive invocation for '$PROVIDER_CLI'. Set --provider claude or --provider codex for now." > "$log_file"
-      return 1
-      ;;
-  esac
 }
 
 # Initialize state file if it doesn't exist
@@ -436,9 +350,13 @@ process_offer() {
     -e "s|{{ID}}|${esc_id}|g" \
     "$PROMPT_FILE" > "$resolved_prompt"
 
-  # Launch worker via the configured provider CLI.
+  # Launch claude -p worker (uses default model from Claude Max subscription)
   local exit_code=0
-  run_worker "$resolved_prompt" "$prompt" "$log_file" || exit_code=$?
+  claude -p \
+    --dangerously-skip-permissions \
+    --append-system-prompt-file "$resolved_prompt" \
+    "$prompt" \
+    > "$log_file" 2>&1 || exit_code=$?
 
   # Cleanup resolved prompt
   rm -f "$resolved_prompt"
